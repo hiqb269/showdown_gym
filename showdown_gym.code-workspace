@@ -1,0 +1,23 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../poke-env"
+		},
+		{
+			"path": "../pokemon-showdown"
+		},
+		{
+			"path": "../showdown_agent"
+		},
+		{
+			"path": "../cares_reinforcement_learning"
+		},
+		{
+			"path": "../gymnasium_envrionments"
+		}
+	],
+	"settings": {}
+}
