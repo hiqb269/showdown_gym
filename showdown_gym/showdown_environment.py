@@ -9,14 +9,14 @@ from poke_env import (
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
-from poke_env.battle import AbstractBattle
+from poke_env.battle import AbstractBattle,Move, Pokemon, Weather
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.environment.singles_env import ObsType
 from poke_env.player.player import Player
 
 from showdown_gym.base_environment import BaseShowdownEnv
 
-
+#Version 4 - Simple reward function - rich observations (train with Rainbow and SACD)
 class ShowdownEnvironment(BaseShowdownEnv):
 
     def __init__(
@@ -35,37 +35,44 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         self.rl_agent = account_name_one
 
-    def _get_action_size(self) -> int | None:
+    def _get_action_size(self) -> int:
         """
-        None just uses the default number of actions as laid out in process_action - 26 actions.
-
-        This defines the size of the action space for the agent - e.g. the output of the RL agent.
-
-        This should return the number of actions you wish to use if not using the default action scheme.
+        Returns the size of the simplified action space: 6 switches + 4 moves = 10 actions.
         """
-        return None  # Return None if action size is default
+        return 10
 
     def process_action(self, action: np.int64) -> np.int64:
         """
-        Returns the np.int64 relative to the given action.
-
-        The action mapping is as follows:
-        action = -2: default
-        action = -1: forfeit
-        0 <= action <= 5: switch
-        6 <= action <= 9: move
-        10 <= action <= 13: move and mega evolve
-        14 <= action <= 17: move and z-move
-        18 <= action <= 21: move and dynamax
-        22 <= action <= 25: move and terastallize
-
-        :param action: The action to take.
-        :type action: int64
-
-        :return: The battle order ID for the given action in context of the current battle.
-        :rtype: np.Int64
+        Maps a simplified action (0-9) to a valid switch or move action for poke-env.
+        0-5: switch to slot (if valid)
+        6-9: use move index (if valid)
+        Returns a valid poke-env action code, or falls back to first valid move/switch.
         """
-        return action
+        battle = getattr(self, 'battle1', None)
+        if battle is None:
+            return np.int64(-2)  # default/no-op if no battle
+        # Switch actions: 0-5
+        if 0 <= action <= 5:
+            team_list = list(battle.team.values())
+            valid_switches = [i for i, mon in enumerate(team_list)
+                              if not mon.fainted and mon is not battle.active_pokemon]
+            if action in valid_switches:
+                return np.int64(action)
+            if valid_switches:
+                return np.int64(valid_switches[0])  # fallback to first valid switch
+            else:
+                action = 6
+            # No valid switches, fallback to first move
+        # Move actions: 6-9
+        if 6 <= action <= 9:
+            move_idx = action - 6
+            available_moves = list(battle.available_moves)
+            if move_idx < len(available_moves):
+                return np.int64(6 + move_idx)
+            if available_moves:
+                return np.int64(6)  # fallback to first move
+        # If no valid action, forfeit
+        return np.int64(-1)
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
@@ -76,6 +83,27 @@ class ShowdownEnvironment(BaseShowdownEnv):
         if self.battle1 is not None:
             agent = self.possible_agents[0]
             info[agent]["win"] = self.battle1.won
+        
+            info[agent]["team_faint_count"] = sum(1 for mon in self.battle1.team.values() if mon.fainted)
+            info[agent]["opponent_faint_count"] = sum(1 for mon in self.battle1.opponent_team.values() if mon.fainted)
+            info[agent]["opponent_revealed_count"] = len(self.battle1.opponent_team)
+
+            team_hp_map = {mon.species: round(mon.current_hp_fraction, 2) for mon in self.battle1.team.values()}
+            opp_hp_map = {mon.species: round(mon.current_hp_fraction, 2) for mon in self.battle1.opponent_team.values()}
+            num_unrevealed = 6 - len(self.battle1.opponent_team)
+            for i in range(num_unrevealed):
+                opp_hp_map[f"unrevealed_{i+1}"] = 1.0
+            
+            info[agent]["team_hp"] = team_hp_map
+            info[agent]["opponent_hp"] = opp_hp_map
+            
+            if self.battle1.active_pokemon:
+                info[agent]["active_pokemon"] = self.battle1.active_pokemon.species
+                info[agent]["active_pokemon_hp"] = self.battle1.active_pokemon.current_hp_fraction
+
+            if self.battle1.opponent_active_pokemon:
+                info[agent]["opponent_active_pokemon"] = self.battle1.opponent_active_pokemon.species
+                info[agent]["opponent_active_hp"] = self.battle1.opponent_active_pokemon.current_hp_fraction
 
         return info
 
@@ -107,11 +135,13 @@ class ShowdownEnvironment(BaseShowdownEnv):
             health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
 
         prior_health_opponent = []
+        prior_health_team = []
         if prior_battle is not None:
             prior_health_opponent = [
                 mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
             ]
-
+            prior_health_team = [mon.current_hp_fraction for mon in prior_battle.team.values()]
+        #PLAY AROUND WITH MULTIPLIERS OF THE REWARD COMPONENTS HERE TO TUNE THE AGENT
         # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
         if len(prior_health_opponent) < len(health_team):
             prior_health_opponent.extend(
@@ -121,9 +151,39 @@ class ShowdownEnvironment(BaseShowdownEnv):
         diff_health_opponent = np.array(prior_health_opponent) - np.array(
             health_opponent
         )
+        diff_health_team = np.array(prior_health_team) - np.array(health_team)
 
-        # Reward for reducing the opponent's health
-        reward += np.sum(diff_health_opponent)
+        reward += 3.0 * (np.sum(diff_health_opponent) - np.sum(diff_health_team))
+
+        # KO bonuses for newly-fainted mons (detect where prev was >0 and curr==0) 
+        
+        faint_opp = np.sum((np.array(prior_health_opponent) > 0.001) & (np.array(health_opponent) <= 0.001))
+        faint_own = np.sum((np.array(prior_health_team) > 0.001) & (np.array(health_team) <= 0.001))
+        reward += 4.0 * float(faint_opp)     # reward for opponent faint
+        reward -= 4.0 * float(faint_own)     # penalty for own faint
+        # Team balance reward
+        # Calculate prior_team_balance 
+        prior_own_alive=[]
+        prior_opp_alive=[]
+        prior_team_balance = 0.0
+        if prior_battle is not None:
+            prior_own_alive = sum(1 for p in prior_battle.team.values() if not p.fainted)
+            prior_opp_alive = sum(1 for p in prior_battle.opponent_team.values() if not p.fainted)
+            max_team_prior = max(len(prior_battle.team), len(prior_battle.opponent_team), 1)
+            prior_team_balance = (prior_own_alive - prior_opp_alive) / max_team_prior
+
+        own_alive = sum(1 for p in battle.team.values() if not p.fainted)
+        opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+        max_team = max(len(battle.team), len(battle.opponent_team), 1)
+        team_balance = (own_alive - opp_alive) / max_team
+
+        reward += 2.0 * (team_balance - prior_team_balance)
+
+        if battle.finished:
+            if battle.won:
+                reward += 10.0  
+            else:
+                reward -= 10.0 
 
         return reward
 
@@ -138,9 +198,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
             int: The size of the observation space.
         """
 
-        # Simply change this number to the number of features you want to include in the observation from embed_battle.
-        # If you find a way to automate this, please let me know!
-        return 12
+        # Updated calculation:
+        return 213
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
@@ -157,28 +216,352 @@ class ShowdownEnvironment(BaseShowdownEnv):
             np.float32: A 1D numpy array containing the state you want the agent to observe.
         """
 
+        # Basic health info (12 components)
         health_team = [mon.current_hp_fraction for mon in battle.team.values()]
         health_opponent = [
             mon.current_hp_fraction for mon in battle.opponent_team.values()
         ]
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
+        # Ensure health_opponent has 6 components, filling missing values with 1.0
         if len(health_opponent) < len(health_team):
             health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
 
-        #########################################################################################################
-        # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
-        #########################################################################################################
+        # Active Pokemon info
+        active_pokemon = battle.active_pokemon
+        opp_active_pokemon = battle.opponent_active_pokemon
+        
+        # Speed estimation for priority decisions 
+        my_speed = self._estimate_speed(active_pokemon) / 400.0 if active_pokemon else 0.0  # normalize
+        opp_speed = self._estimate_speed(opp_active_pokemon) / 400.0 if opp_active_pokemon else 0.0
+        speed_priority = 1.0 if my_speed > opp_speed else (0.0 if my_speed < opp_speed else 0.5) # one component for speed
+        
+        # Stat boosts -  (12 components: 6 stats x 2 pokemon)
+        my_boosts = [
+            active_pokemon.boosts.get(stat, 0) / 6.0 if active_pokemon else 0.0 
+            for stat in ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy']
+        ]
+        opp_boosts = [
+            opp_active_pokemon.boosts.get(stat, 0) / 6.0 if opp_active_pokemon else 0.0 
+            for stat in ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy']
+        ]
+        
+        
+        # Battle hazards (8 entry hazards)
+        battle_hazards = [
+            1.0 if battle.side_conditions.get('stealthrock') else 0.0,
+            battle.side_conditions.get('spikes', 0) / 3.0,  # 0-3 layers normalized
+            1.0 if battle.side_conditions.get('toxicspikes') else 0.0,
+            1.0 if battle.side_conditions.get('stickyweb') else 0.0,
+    
+            # Entry Hazards - Opponent Side (4 components)
+            1.0 if battle.opponent_side_conditions.get('stealthrock') else 0.0,
+            battle.opponent_side_conditions.get('spikes', 0) / 3.0,
+            1.0 if battle.opponent_side_conditions.get('toxicspikes') else 0.0,
+            1.0 if battle.opponent_side_conditions.get('stickyweb') else 0.0,
+        ]
 
-        # Final vector - single array with health of both teams
-        final_vector = np.concatenate(
-            [
-                health_team,  # N components for the health of each pokemon
-                health_opponent,  # N components for the health of opponent pokemon
-            ]
-        )
+        weather_encoding = self._get_weather_one_hot(battle)  # 5 components
 
-        return final_vector
+        # Battle state info (4 components)
+        battle_state = [
+            battle.turn / 100.0,  # normalize turn number
+            len([p for p in battle.team.values() if not p.fainted]) / 6.0,  # team alive ratio
+            (len([p for p in battle.opponent_team.values() if not p.fainted]) + (6 - len(battle.opponent_team))) / 6.0,  # opp alive ratio (assume unrevealed are alive)
+            1.0 if battle.can_mega_evolve else 0.0,
+        ]
+        
+        # Move effectiveness predictions (4 components) 
+        move_effectiveness = self._get_move_effectiveness_for_active(battle)
+        bp_vals = self._get_move_base_powers(battle)
+        # Normalize base power (cap to 1.0) and weight effectiveness by normalized power
+        bp_array = np.clip(np.array(bp_vals, dtype=np.float32) / 100.0, 0.0, 1.0) #Base power array (4 components)
+
+        #Defense strategy - One-hot encode Pokemon types (18 + 18 components)
+        my_types = self._get_type_one_hot(active_pokemon)     # 18 dims
+        opp_types = self._get_type_one_hot(opp_active_pokemon) # 18 dims
+
+        #Switch strategy - One-hot encode all team pokemon types in teams (not just active)
+        my_bench_info = self._get_bench_info(battle)
+
+        status_conditions = self._get_status_conditions(battle)
+        # Final vector assembly
+        final_vector = np.concatenate([
+            health_team,              # 6 components
+            health_opponent,          # 6 components  
+            [speed_priority],         # 1 components
+            my_boosts,                # 6 components
+            opp_boosts,               # 6 components
+            battle_hazards,           # 8 components
+            weather_encoding,         # 5 components
+            battle_state,             # 4 components
+            move_effectiveness,       # 4 components
+            bp_array,                 # 4 components
+            my_types,                 # 18 components
+            opp_types,                # 18 components
+            my_bench_info,            # 115 components
+            status_conditions         # 12 components
+        ])
+        #print(f"DEBUG: Health team size: {len(health_team)} expected 6\n Health opponent size: {len(health_opponent)} expected 6\n Speed priority size:{len([speed_priority])} expected 1\n My boosts size: {len(my_boosts)} expected 6\n Opp boosts size: {len(opp_boosts)} expected 6\n Battle hazards size: {len(battle_hazards)} expected 4\n Weather encoding size: {len(weather_encoding)} expected 5\n Battle state size: {len(battle_state)} expected 4\n Move effectiveness size: {len(move_effectiveness)} expected 4\n BP array size: {len(bp_array)} expected 4\n My types size: {len(my_types)} expected 18\n Opp types size: {len(opp_types)} expected 18\n My bench info size: {len(my_bench_info)} expected 115\n Status conditions size: {len(status_conditions)} expected 12\n Final vector size: {len(final_vector)} expected {len(final_vector)} expected 213")
+
+        return final_vector.astype(np.float32)
+    
+    def _get_weather_one_hot(self, battle) -> list:
+        """
+        One-hot encode weather conditions.
+        Returns: [no_weather, sun, rain, sandstorm, snow] (5 components)
+        """
+        weather = battle.weather
+        # One-hot encoding for 5 weather states
+        weather_encoding = [0.0, 0.0, 0.0, 0.0, 0.0]
+    
+        if weather is None:
+            weather_encoding[0] = 1.0  # No weather
+        elif weather == Weather.SUNNYDAY:
+            weather_encoding[1] = 1.0  # Sun
+        elif weather == Weather.RAINDANCE:
+            weather_encoding[2] = 1.0  # Rain
+        elif weather == Weather.SANDSTORM:
+            weather_encoding[3] = 1.0  # Sandstorm
+        elif weather == Weather.SNOW: 
+            weather_encoding[4] = 1.0  # Snow/Hail
+        else:
+            weather_encoding[0] = 1.0  # Default to no weather if unknown
+        return weather_encoding
+    
+    def _get_type_one_hot(self, pokemon: Pokemon) -> np.ndarray:
+        """
+        One-hot encode Pokemon types.
+        18 types in Pokemon: Normal, Fire, Water, Electric, Grass, Ice, Fighting, 
+        Poison, Ground, Flying, Psychic, Bug, Rock, Ghost, Dragon, Dark, Steel, Fairy
+        
+        Returns:
+            np.ndarray: 18-component one-hot encoded array
+        """
+        type_names = [
+            'normal', 'fire', 'water', 'electric', 'grass', 'ice',
+            'fighting', 'poison', 'ground', 'flying', 'psychic',
+            'bug', 'rock', 'ghost', 'dragon', 'dark', 'steel', 'fairy'
+        ]
+        
+        type_encoding = np.zeros(18, dtype=np.float32)
+    
+        if pokemon and pokemon.types:
+            for poke_type in pokemon.types:
+                type_name = str(poke_type).lower()
+                if type_name in type_names:
+                    i = type_names.index(type_name)
+                    type_encoding[i] = 1.0
+
+        return type_encoding
+
+    def _estimate_speed(self, pokemon):
+        # Defensive: handle missing pokemon or missing base_stats
+        if not pokemon:
+            return 100.0
+
+        base_stats = getattr(pokemon, "base_stats", None) or {}
+        base_speed = base_stats.get('spe', 0)
+
+        # Assume level 100 and common investment: max for base >= 100, else neutral
+        if base_speed >= 100:
+            # Max investment: 31 IV, 252 EV, beneficial nature (1.1x)
+            raw_speed = (2 * base_speed + 31 + 63) + 5  # 63 from floor(252/4)
+            estimated_speed = int(raw_speed * 1.1)
+        else:
+            # Neutral investment: 31 IV, 0 EV, neutral nature (1.0x)
+            estimated_speed = (2 * base_speed + 31 + 0) + 5
+
+        # Apply boosts/drops (from moves like Dragon Dance)
+        boost = 0
+        if hasattr(pokemon, 'boosts') and pokemon.boosts:
+            try:
+                boost = pokemon.boosts.get('spe', 0)
+            except Exception:
+                boost = 0
+
+        multiplier = {
+            -6: 0.25, -5: 2/7, -4: 2/6, -3: 0.4, -2: 0.5, -1: 2/3,
+            0: 1.0, 1: 1.5, 2: 2.0, 3: 2.5, 4: 3.0, 5: 3.5, 6: 4.0
+        }.get(boost, 1.0)
+        estimated_speed *= multiplier
+
+        return float(estimated_speed)
+    
+    def _get_move_effectiveness_for_active(self, battle):
+        """Get effectiveness of moves for the active Pokémon.
+
+        Returns:
+            list[float]: effectiveness values for up to 4 moves, padded with 0.0
+        """
+        effectiveness_values = [0.0, 0.0, 0.0, 0.0]
+
+        active = getattr(battle, "active_pokemon", None)
+        defender = getattr(battle, "opponent_active_pokemon", None)
+        effective_values = self._get_move_effectiveness(active, defender)
+
+        return effective_values
+
+
+    def _get_move_effectiveness(self, attacker: Pokemon, defender: Pokemon):
+        """Get effectiveness of up to 4 available moves.
+
+        Returns:
+            list[float]: effectiveness values for up to 4 moves, padded with 0.0
+        """
+        effectiveness_values = [0.0, 0.0, 0.0, 0.0]
+        
+        moves = list(attacker.moves.values()) if attacker and hasattr(attacker, "moves") else []
+
+        if defender is None or attacker is None:
+            return effectiveness_values
+
+        for i, move in enumerate(moves[:4]):  # limit to 4 moves
+            try:
+                eff = self._get_damage_multiplier(move, attacker, defender)
+            except Exception:
+                eff = 1.0
+            effectiveness_values[i] = float(eff)
+        return effectiveness_values
+    
+    
+    def _get_bench_info(self, battle) -> np.ndarray:
+        """
+        Essential bench information for switching decisions.
+        Returns 115 components:
+        - bench_types: 90 (5 × 18 one-hot per Pokemon)
+        - bench_can_switch: 5 (availability)
+        - bench_move_effectiveness: 20 (5 × 4 best moves vs opponent)
+        """
+        team_pokemon = [p for p in battle.team.values() if p != battle.active_pokemon]
+        
+        # Bench types (90 dims)
+        bench_types = []
+        for i in range(5):
+            if i < len(team_pokemon):
+                pokemon_types = self._get_type_one_hot(team_pokemon[i])
+            else:
+                pokemon_types = np.zeros(18, dtype=np.float32)
+            bench_types.append(pokemon_types)
+    
+        # Bench availability (5 dims)
+        available_switches = battle.available_switches
+        bench_availability = []
+        for i in range(5):
+            if i < len(team_pokemon):
+                can_switch = 1.0 if team_pokemon[i] in available_switches else 0.0
+            else:
+                can_switch = 0.0
+            bench_availability.append(can_switch)
+    
+        # Bench move effectiveness (20 dims)
+        bench_moves = []
+        for i in range(5):
+            if i < len(team_pokemon) and battle.opponent_active_pokemon:
+                pokemon = team_pokemon[i]
+                move_effs = self._get_move_effectiveness(
+                    pokemon, battle.opponent_active_pokemon
+                )
+            else:
+                move_effs = [0.0, 0.0, 0.0, 0.0]
+            bench_moves.extend(move_effs)
+    
+        # Concatenate all bench info
+        return np.concatenate([
+            np.concatenate(bench_types),           # 90
+            np.array(bench_availability),           # 5
+            np.array(bench_moves, dtype=np.float32) # 20
+        ])
+        # Total: 115 dimensions
+
+    def _get_move_base_powers(self, battle):
+        """Get base powers of up to 4 available moves.
+
+        Returns:
+            list[float]: base power values for up to 4 moves, padded with 0.0
+        """
+        base_power_values = [0.0, 0.0, 0.0, 0.0]
+
+        # Defensive checks: battle may not have available_moves
+        if not hasattr(battle, "available_moves") or not battle.available_moves:
+            return base_power_values
+        for i, move in enumerate(list(battle.available_moves)[:4]):  # limit to 4 moves
+            try:
+                bp = getattr(move, "base_power", 0) or 0
+            except Exception:
+                bp = 0
+            base_power_values[i] = float(bp)
+
+        return base_power_values
+    
+    def _get_status_conditions(self, battle) -> np.ndarray:
+        """
+        Get status condition information for active Pokemon on both sides.
+        
+        Returns 12 components:
+        - Our active status (6): [none, burn, paralysis, poison, sleep, freeze]
+        - Opponent active status (6): [none, burn, paralysis, poison, sleep, freeze]
+        """
+        our_status = self._encode_status_one_hot(battle.active_pokemon)
+        opp_status = self._encode_status_one_hot(battle.opponent_active_pokemon)
+        
+        return np.concatenate([our_status, opp_status])
+    
+
+    def _encode_status_one_hot(self, pokemon: Pokemon) -> np.ndarray:
+        """
+        One-hot encode status condition.
+        [none, burn, paralysis, poison/toxic, sleep, freeze]
+        """
+        status_encoding = np.zeros(6, dtype=np.float32)
+        
+        if not pokemon or not pokemon.status:
+            status_encoding[0] = 1.0  # No status
+        else:
+            status_str = str(pokemon.status).lower()
+            if 'brn' in status_str or 'burn' in status_str:
+                status_encoding[1] = 1.0
+            elif 'par' in status_str or 'paralysis' in status_str:
+                status_encoding[2] = 1.0
+            elif 'psn' in status_str or 'tox' in status_str or 'poison' in status_str:
+                status_encoding[3] = 1.0
+            elif 'slp' in status_str or 'sleep' in status_str:
+                status_encoding[4] = 1.0
+            elif 'frz' in status_str or 'freeze' in status_str:
+                status_encoding[5] = 1.0
+            else:
+                status_encoding[0] = 1.0  # Unknown = treat as none
+        
+        return status_encoding
+    
+    def _get_damage_multiplier(self, move: Move, attacker: Pokemon, defender: Pokemon) -> float:
+        """
+        Estimates the damage a move would deal.
+        """
+        # Defensive: ensure move, attacker, defender exist and have expected attributes
+        if not move:
+            return 0.0
+
+        base_power = getattr(move, 'base_power', None)
+        if base_power in (None, 0):
+            return 0.0
+
+        multiplier = 1.0
+        try:
+            if defender is not None and not getattr(defender, 'fainted', False):
+                if hasattr(defender, 'damage_multiplier'):
+                    multiplier = defender.damage_multiplier(move)
+        except Exception:
+            multiplier = 1.0
+
+        # STAB check: attacker may be None or missing types
+        try:
+            attacker_types = getattr(attacker, 'types', []) or []
+            if getattr(move, 'type', None) in attacker_types:
+                multiplier *= 1.5  # STAB
+        except Exception:
+            pass
+
+        return float(multiplier)
 
 
 ########################################
@@ -187,6 +570,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
 
 class SingleShowdownWrapper(SingleAgentWrapper):
+
     """
     A wrapper class for the PokeEnvironment that simplifies the setup of single-agent
     reinforcement learning tasks in a Pokémon battle environment.
